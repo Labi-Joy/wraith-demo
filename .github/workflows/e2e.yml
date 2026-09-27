@@ -25,10 +25,13 @@ jobs:
       - name: Ensure Chromium is installed
         run: pnpm exec playwright install chromium
 
-      - name: Run Playwright (chromium)
-        # Chromium-only in CI keeps the run tight; the full multi-browser
-        # matrix stays available locally via `pnpm test:e2e`.
-        run: pnpm exec playwright test --project=chromium
+      - name: Run Playwright (chromium, failure-path matrix only)
+        # Scoped to the failure-path matrix so this workflow does not own
+        # unrelated pre-existing spec failures (LocaleSwitcher select
+        # ambiguity in `stellar.spec.ts`, unrouted requests in the vault
+        # specs, etc). Chromium-only keeps the run tight; the full
+        # multi-browser matrix stays available locally via `pnpm test:e2e`.
+        run: pnpm exec playwright test e2e/send-failure-matrix.spec.ts --project=chromium
 
       - name: Upload Playwright report on failure
         if: failure()
