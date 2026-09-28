@@ -1,5 +1,13 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { Address, Keypair, nativeToScVal, xdr } from '@stellar/stellar-sdk';
+import {
+  Account,
+  Address,
+  Asset,
+  Keypair,
+  Networks,
+  nativeToScVal,
+  xdr,
+} from '@stellar/stellar-sdk';
 import {
   bytesToHex,
   deriveStealthKeys,
@@ -12,8 +20,28 @@ import {
   formatVaultAmount,
   scanVaultAnnouncements,
   fetchVaultDepositEvents,
+  getVaultDeposit,
   awaitVaultClaimConfirmation,
+  loadClaimableVaultDeposits,
+  loadPersistedRecipientVaultDeposits,
+  recipientVaultStorageKey,
 } from './vaultClaim';
+
+class MemoryStorage implements Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+  private values = new Map<string, string>();
+
+  getItem(key: string) {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string) {
+    this.values.set(key, value);
+  }
+
+  removeItem(key: string) {
+    this.values.delete(key);
+  }
+}
 
 function randomSignature(): Uint8Array {
   const bytes = new Uint8Array(64);
@@ -185,6 +213,128 @@ describe('fetchVaultDepositEvents', () => {
       VAULT_CONTRACT_ID,
     );
     expect(events).toEqual([]);
+  });
+});
+
+describe('recipient vault deposit retention', () => {
+  it('reloads an active incoming deposit after its announcement and event leave retention', async () => {
+    const storage = new MemoryStorage();
+    const recipientKeys = deriveStealthKeys(new Uint8Array(64).fill(7));
+    const announcement = makeVaultAnnouncement(
+      recipientKeys.spendingPubKey,
+      recipientKeys.viewingPubKey,
+    );
+    const depositId = 'ab'.repeat(32);
+    const sourceAddress = Keypair.random().publicKey();
+    const sender = Keypair.random().publicKey();
+    const vaultContractId = 'CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL';
+    const asset = Asset.native().contractId(Networks.TESTNET);
+    const server = {
+      getLatestLedger: vi.fn(async () => ({ sequence: 50_000 })),
+      getAccount: vi.fn(async () => new Account(sourceAddress, '1')),
+      simulateTransaction: vi.fn(async () => ({
+        result: {
+          retval: xdr.ScVal.scvMap([
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvSymbol('sender'),
+              val: new Address(sender).toScVal(),
+            }),
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvSymbol('recipient'),
+              val: new Address(announcement.stealthAddress).toScVal(),
+            }),
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvSymbol('amount'),
+              val: nativeToScVal(25_0000000n, { type: 'i128' }),
+            }),
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvSymbol('asset'),
+              val: new Address(asset).toScVal(),
+            }),
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvSymbol('unlock_ledger'),
+              val: nativeToScVal(40_000, { type: 'u32' }),
+            }),
+            new xdr.ScMapEntry({
+              key: xdr.ScVal.scvSymbol('refund_after'),
+              val: nativeToScVal(60_000, { type: 'u32' }),
+            }),
+          ]),
+        },
+      })),
+    };
+    const baseParams = {
+      vaultContractId,
+      sourceAddress,
+      viewingKey: recipientKeys.viewingKey,
+      spendingPubKey: recipientKeys.spendingPubKey,
+      spendingScalar: recipientKeys.spendingScalar,
+      networkPassphrase: Networks.TESTNET,
+      server,
+      storage,
+    };
+
+    await expect(
+      getVaultDeposit(
+        server,
+        new Account(sourceAddress, '1'),
+        Networks.TESTNET,
+        vaultContractId,
+        depositId,
+      ),
+    ).resolves.toMatchObject({ recipient: announcement.stealthAddress, sender });
+
+    const discovered = await loadClaimableVaultDeposits({
+      ...baseParams,
+      fetchAnnouncementsFn: async () => [announcement],
+      fetchDepositEventsFn: async () => [
+        {
+          depositId,
+          sender,
+          amount: 25_0000000n,
+          asset,
+          unlockLedger: 40_000,
+        },
+      ],
+    });
+
+    expect(discovered.deposits).toHaveLength(1);
+    expect(
+      loadPersistedRecipientVaultDeposits(
+        storage,
+        sourceAddress,
+        vaultContractId,
+        Networks.TESTNET,
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        depositId,
+        recipient: announcement.stealthAddress,
+        ephemeralPubKey: announcement.ephemeralPubKey,
+        metadata: announcement.metadata,
+      }),
+    ]);
+    const persistedRaw = storage.getItem(
+      recipientVaultStorageKey(sourceAddress, vaultContractId, Networks.TESTNET),
+    );
+    expect(persistedRaw).not.toContain('stealthPrivateScalar');
+    expect(persistedRaw).not.toContain(recipientKeys.spendingScalar.toString());
+
+    const afterRetention = await loadClaimableVaultDeposits({
+      ...baseParams,
+      fetchAnnouncementsFn: async () => [],
+      fetchDepositEventsFn: async () => [],
+    });
+
+    expect(afterRetention.deposits).toHaveLength(1);
+    expect(afterRetention.deposits[0]).toMatchObject({
+      depositId,
+      recipient: announcement.stealthAddress,
+      sender,
+      amount: 25_0000000n,
+      isUnlocked: true,
+    });
+    expect(typeof afterRetention.deposits[0].stealthPrivateScalar).toBe('bigint');
   });
 });
 

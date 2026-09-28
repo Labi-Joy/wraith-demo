@@ -7,6 +7,22 @@ import { NetworkFirst, CacheFirst } from 'workbox-strategies';
 import { ExpirationPlugin } from 'workbox-expiration';
 import { CacheableResponsePlugin } from 'workbox-cacheable-response';
 import { CACHE_PREFIX, CACHE_VERSION_SUFFIX, cacheName, purgeObsoleteCaches } from '../lib/swCache';
+import {
+  retentionErrorFromRpcMessage,
+  retentionGapFromError,
+  type RetentionGap,
+} from '../lib/stellar/scannerCursor';
+import {
+  deliverPushNotification,
+  type NotificationPresentation,
+  type ValidatedPushPayload,
+} from './notificationPayload';
+import {
+  claimNotificationId,
+  createNotificationStore,
+  pruneNotificationIds,
+  releaseNotificationId,
+} from './notificationStore';
 
 declare const self: ServiceWorkerGlobalScope;
 
@@ -79,7 +95,7 @@ registerRoute(
 const ANNOUNCER_CONTRACT = 'CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL';
 const STELLAR_RPC_URL = 'https://soroban-testnet.stellar.org';
 const DB_NAME = 'wraith-stellar-notifications';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_NAME = 'viewing-keys';
 const SYNC_TAG = 'stellar-payment-scan';
 const SYNC_INTERVAL_MINUTES = 15;
@@ -105,9 +121,13 @@ interface PushSubscriptionJSON {
 }
 
 interface NotificationData {
-  stealthAddress: string;
+  id: string;
+  stealthAddress?: string;
   amount?: string;
+  asset?: string;
+  sender?: string;
   timestamp: number;
+  url: string;
 }
 
 // ── IndexedDB helpers ──────────────────────────────────────────────────────────
@@ -123,6 +143,7 @@ function openDB(): Promise<IDBDatabase> {
         const store = db.createObjectStore(STORE_NAME, { keyPath: 'publicKey' });
         store.createIndex('timestamp', 'timestamp', { unique: false });
       }
+      createNotificationStore(db);
     };
   });
 }
@@ -183,9 +204,33 @@ async function fetchAnnouncementEvents(
     }),
   });
   const data = await response.json();
+  if (data.error?.message) {
+    const retentionError = retentionErrorFromRpcMessage(startLedger, String(data.error.message));
+    throw retentionError ?? new Error(String(data.error.message));
+  }
   const events = data.result?.events || [];
   const latestLedger = await fetchLatestLedger();
   return { events, latestLedger };
+}
+
+async function notifyRetentionGap(publicKey: string, gap: RetentionGap): Promise<void> {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  for (const client of clients) {
+    client.postMessage({ type: 'STELLAR_SCAN_RETENTION_GAP', publicKey, ...gap });
+  }
+}
+
+async function scanStoredKey(
+  db: IDBDatabase,
+  storedKey: StoredViewingKey,
+  startLedger: number,
+): Promise<void> {
+  const { events, latestLedger } = await fetchAnnouncementEvents(startLedger);
+  if (events.length > 0) {
+    console.log(`Found ${events.length} events for ${storedKey.publicKey}`);
+    // TODO: decrypt and scan with Wraith SDK when bundled in SW context
+  }
+  await updateLastScannedLedger(db, storedKey.publicKey, latestLedger + 1);
 }
 
 // ── Background sync handler ────────────────────────────────────────────────────
@@ -203,14 +248,17 @@ async function handleSync(): Promise<void> {
 
     for (const storedKey of allKeys) {
       const startLedger = storedKey.lastScannedLedger || 1;
-      const { events, latestLedger } = await fetchAnnouncementEvents(startLedger);
-
-      if (events.length > 0) {
-        console.log(`Found ${events.length} events for ${storedKey.publicKey}`);
-        // TODO: decrypt and scan with Wraith SDK when bundled in SW context
+      try {
+        await scanStoredKey(db, storedKey, startLedger);
+      } catch (error) {
+        const gap = retentionGapFromError(error);
+        if (!gap) throw error;
+        if (storedKey.lastScannedLedger === undefined) {
+          await scanStoredKey(db, storedKey, gap.oldestAvailableLedger);
+        } else {
+          await notifyRetentionGap(storedKey.publicKey, gap);
+        }
       }
-
-      await updateLastScannedLedger(db, storedKey.publicKey, latestLedger);
     }
 
     db.close();
@@ -280,17 +328,14 @@ self.addEventListener('notificationclick', (event) => {
       const existing = clientList.find((c) => c.url.includes(self.location.origin) && 'focus' in c);
       if (existing) {
         (existing as WindowClient).focus();
-        (existing as WindowClient).navigate('/notifications');
+        (existing as WindowClient).navigate(data?.url ?? '/notifications');
         // Also post match info so the page can pre-highlight it
         if (data?.stealthAddress) {
           existing.postMessage({ type: 'NAVIGATE_TO_MATCH', stealthAddress: data.stealthAddress });
         }
         return;
       }
-      const dest = data?.stealthAddress
-        ? `/notifications?match=${data.stealthAddress}`
-        : '/notifications';
-      return self.clients.openWindow(dest);
+      return self.clients.openWindow(data?.url ?? '/notifications');
     }),
   );
 });
@@ -303,6 +348,44 @@ self.addEventListener('message', (event) => {
 
   if (type === 'SKIP_WAITING') {
     self.skipWaiting();
+    return;
+  }
+
+  if (type === 'RECOVER_SCAN_CURSOR') {
+    event.waitUntil(
+      (async () => {
+        const db = await openDB();
+        try {
+          const recoveryLedger = Number(event.data.oldestAvailableLedger);
+          if (
+            typeof publicKey !== 'string' ||
+            !Number.isSafeInteger(recoveryLedger) ||
+            recoveryLedger <= 0
+          ) {
+            return;
+          }
+          const storedKey = await new Promise<StoredViewingKey | undefined>((resolve, reject) => {
+            const request = db
+              .transaction(STORE_NAME, 'readonly')
+              .objectStore(STORE_NAME)
+              .get(publicKey);
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => resolve(request.result);
+          });
+          if (!storedKey) return;
+          await scanStoredKey(db, storedKey, recoveryLedger);
+          const clients = await self.clients.matchAll({
+            type: 'window',
+            includeUncontrolled: true,
+          });
+          clients.forEach((client) =>
+            client.postMessage({ type: 'STELLAR_SCAN_RECOVERY_COMPLETE', publicKey }),
+          );
+        } finally {
+          db.close();
+        }
+      })(),
+    );
     return;
   }
 
@@ -483,103 +566,47 @@ self.addEventListener('message', (event) => {
 
 // ── Push (future) ──────────────────────────────────────────────────────────────
 
-interface PushPayload {
-  id: string;
-  title: string;
-  body: string;
-  amount?: string;
-  asset?: string;
-  sender?: string;
-  data?: Record<string, unknown>;
-}
-
-interface NotificationData {
-  stealthAddress: string;
-  amount?: string;
-  timestamp: number;
-}
-
-// Store for deduplication of notifications
-const PROCED_NOTIFICATIONS = new Set<string>();
-
-// Helper to check if notification was already processed
-function isNotificationProcessed(id: string): boolean {
-  if (PROCED_NOTIFICATIONS.has(id)) {
-    return true;
+async function broadcastToClients(payload: ValidatedPushPayload, timestamp: number): Promise<void> {
+  const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+  for (const client of clients) {
+    client.postMessage({
+      type: 'WRAITH_NOTIFICATION',
+      channel: 'wraith-notifications',
+      payload: { ...payload, timestamp },
+    });
   }
-  PROCED_NOTIFICATIONS.add(id);
-  // Limit cache size to prevent memory issues
-  if (PROCED_NOTIFICATIONS.size > 1000) {
-    const first = PROCED_NOTIFICATIONS.values().next().value;
-    PROCED_NOTIFICATIONS.delete(first);
-  }
-  return false;
-}
-
-function parsePushPayload(event: PushEvent): PushPayload {
-  try {
-    const json = event.data?.json() as Partial<PushPayload> | undefined;
-    if (json && json.title) {
-      return {
-        id: json.id ?? `sw-${Date.now()}`,
-        title: json.title,
-        body: json.body ?? '',
-        amount: json.amount,
-        asset: json.asset,
-        sender: json.sender,
-        data: json.data,
-      };
-    }
-  } catch {
-    // ignore parse errors — fall through to default
-  }
-  return {
-    id: `sw-${Date.now()}`,
-    title: 'New stealth payment detected',
-    body: 'Open Wraith to view payment details.',
-  };
 }
 
 self.addEventListener('push', (event: PushEvent) => {
-  const payload = parsePushPayload(event);
-
-  // Deduplicate: skip if we've already processed this notification
-  if (isNotificationProcessed(payload.id)) {
-    console.log(`[app-sw] Skipping duplicate notification: ${payload.id}`);
-    return;
-  }
-
-  const lines: string[] = [payload.body];
-  if (payload.amount && payload.asset) {
-    lines.push(`Amount: ${payload.amount} ${payload.asset}`);
-  } else if (payload.amount) {
-    lines.push(`Amount: ${payload.amount}`);
-  }
-  if (payload.sender) {
-    const short =
-      payload.sender.length > 24
-        ? `${payload.sender.slice(0, 10)}…${payload.sender.slice(-10)}`
-        : payload.sender;
-    lines.push(`From: ${short}`);
-  }
-
-  const notificationOptions: NotificationOptions = {
-    body: lines.join('\n'),
-    icon: '/favicon-32x32.png',
-    badge: '/favicon-16x16.png',
-    tag: payload.id,
-    data: {
-      id: payload.id,
-      stealthAddress: payload.sender,
-      amount: payload.amount,
-      asset: payload.asset,
-      sender: payload.sender,
-      timestamp: Date.now(),
-      ...payload.data,
-    } as NotificationData & Record<string, unknown>,
-  };
-
-  event.waitUntil(self.registration.showNotification(payload.title, notificationOptions));
+  event.waitUntil(
+    (async () => {
+      const db = await openDB();
+      try {
+        const result = await deliverPushNotification(
+          event.data?.text() ?? '',
+          self.location.origin,
+          {
+            claim: (id) => claimNotificationId(db, id),
+            release: (id) => releaseNotificationId(db, id),
+            show: (presentation: NotificationPresentation) =>
+              self.registration.showNotification(presentation.title, {
+                body: presentation.body,
+                icon: '/favicon-32x32.png',
+                badge: '/favicon-16x16.png',
+                tag: presentation.tag,
+                data: presentation.data,
+              }),
+            broadcast: broadcastToClients,
+          },
+        );
+        if (result === 'rejected') console.warn('[app-sw] Rejected invalid push payload');
+        if (result === 'duplicate') console.log('[app-sw] Skipped duplicate notification');
+        if (result === 'delivered') await pruneNotificationIds(db);
+      } finally {
+        db.close();
+      }
+    })(),
+  );
 });
 
 export {};

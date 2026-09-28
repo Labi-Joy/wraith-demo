@@ -2,87 +2,119 @@ import { bytesToHex } from '@wraith-protocol/sdk/chains/stellar';
 import type { Announcement } from '@wraith-protocol/sdk/chains/stellar';
 import { Address, xdr } from '@stellar/stellar-sdk';
 import { scanWithStrategy, DEFAULT_SCAN_STRATEGY, type ScanStrategy } from './stellarScanDispatch';
+import { retentionErrorFromRpcMessage, retentionGapFromError } from '../lib/stellar/scannerCursor';
+
+function parseLedgerRange(message: string): { oldest: number; latest: number } | undefined {
+  const match = message.match(/range:\s*(\d+)\s*-\s*(\d+)/i);
+  if (!match) return undefined;
+  return { oldest: Number(match[1]), latest: Number(match[2]) };
+}
+
+async function getLatestLedger(rpcUrl: string): Promise<number> {
+  const response = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestLedger' }),
+  });
+  const data = await response.json();
+  const sequence = Number(data.result?.sequence);
+  if (!Number.isSafeInteger(sequence) || sequence <= 0) {
+    throw new Error('Stellar RPC did not return a valid latest ledger');
+  }
+  return sequence;
+}
 
 async function fetchAnnouncementEvents(
   rpcUrl: string,
   contractId: string,
-): Promise<Announcement[]> {
+  savedStartLedger?: number,
+): Promise<{ announcements: Announcement[]; nextLedger: number }> {
   const all: Announcement[] = [];
+  const probeRes = await fetch(rpcUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 0,
+      method: 'getEvents',
+      params: {
+        startLedger: 1,
+        filters: [{ type: 'contract', contractIds: [contractId] }],
+        pagination: { limit: 1 },
+      },
+    }),
+  });
+  const probeData = await probeRes.json();
+  const ledgerWindow = probeData.error?.message
+    ? parseLedgerRange(String(probeData.error.message))
+    : undefined;
+  const latestLedger = ledgerWindow?.latest ?? (await getLatestLedger(rpcUrl));
+  const startLedger =
+    savedStartLedger ?? Math.max(ledgerWindow?.oldest ?? 1, Math.max(1, latestLedger - 5000));
 
-  try {
-    let startLedger = 1;
-    const probeRes = await fetch(rpcUrl, {
+  if (ledgerWindow && startLedger < ledgerWindow.oldest) {
+    throw retentionErrorFromRpcMessage(
+      startLedger,
+      `ledger range: ${ledgerWindow.oldest} - ${ledgerWindow.latest}`,
+    );
+  }
+  if (probeData.error?.message && !ledgerWindow) {
+    throw new Error(String(probeData.error.message));
+  }
+
+  let cursor: string | undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    const params: Record<string, unknown> = {
+      filters: [{ type: 'contract', contractIds: [contractId] }],
+      pagination: { limit: 1000 },
+    };
+
+    if (cursor) {
+      (params.pagination as Record<string, unknown>).cursor = cursor;
+    } else {
+      params.startLedger = startLedger;
+    }
+
+    const res = await fetch(rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         jsonrpc: '2.0',
-        id: 0,
+        id: 2,
         method: 'getEvents',
-        params: {
-          startLedger: 1,
-          filters: [{ type: 'contract', contractIds: [contractId] }],
-          pagination: { limit: 1 },
-        },
+        params,
       }),
     });
-    const probeData = await probeRes.json();
+    const data = await res.json();
+    if (data.error?.message) {
+      const range = parseLedgerRange(String(data.error.message));
+      if (range && startLedger < range.oldest) {
+        throw retentionErrorFromRpcMessage(startLedger, String(data.error.message));
+      }
+      throw new Error(String(data.error.message));
+    }
+    const events = data.result?.events ?? [];
 
-    if (probeData.error?.message) {
-      const match = probeData.error.message.match(/range:\s*(\d+)\s*-\s*(\d+)/);
-      if (match) {
-        const oldest = parseInt(match[1], 10);
-        const latest = parseInt(match[2], 10);
-        startLedger = Math.max(oldest, latest - 5000);
-      } else {
-        return all;
+    for (const event of events) {
+      try {
+        const ann = parseAnnouncementEvent(event);
+        if (ann) all.push(ann);
+      } catch {
+        // Skip malformed events without discarding the scan cursor.
       }
     }
 
-    let cursor: string | undefined;
-    let hasMore = true;
-
-    while (hasMore) {
-      const params: Record<string, unknown> = {
-        filters: [{ type: 'contract', contractIds: [contractId] }],
-        pagination: { limit: 1000 },
-      };
-
-      if (cursor) {
-        (params.pagination as Record<string, unknown>).cursor = cursor;
-      } else {
-        params.startLedger = startLedger;
-      }
-
-      const res = await fetch(rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'getEvents', params }),
-      });
-
-      const data = await res.json();
-      const events = data.result?.events ?? [];
-
-      for (const event of events) {
-        try {
-          const ann = parseAnnouncementEvent(event);
-          if (ann) all.push(ann);
-        } catch {
-          // Skip malformed
-        }
-      }
-
-      if (events.length < 1000) {
-        hasMore = false;
-      } else {
-        cursor = data.result?.cursor;
-        if (!cursor) hasMore = false;
-      }
+    if (events.length < 1000) {
+      hasMore = false;
+    } else {
+      cursor = data.result?.cursor;
+      if (!cursor) hasMore = false;
     }
-  } catch {
-    // Events API may not be available
   }
 
-  return all;
+  return { announcements: all, nextLedger: latestLedger + 1 };
 }
 
 function parseAnnouncementEvent(event: Record<string, unknown>): Announcement | null {
@@ -120,6 +152,7 @@ self.onmessage = async (e: MessageEvent) => {
     spendingPubKey,
     spendingScalar,
     strategy,
+    startLedger,
   }: {
     rpcUrl: string;
     announcerContract: string;
@@ -127,10 +160,15 @@ self.onmessage = async (e: MessageEvent) => {
     spendingPubKey: Uint8Array;
     spendingScalar: bigint;
     strategy?: ScanStrategy;
+    startLedger?: number;
   } = e.data;
 
   try {
-    const announcements: Announcement[] = await fetchAnnouncementEvents(rpcUrl, announcerContract);
+    const { announcements, nextLedger } = await fetchAnnouncementEvents(
+      rpcUrl,
+      announcerContract,
+      startLedger,
+    );
     const results = scanWithStrategy(
       strategy ?? DEFAULT_SCAN_STRATEGY,
       announcements,
@@ -138,8 +176,13 @@ self.onmessage = async (e: MessageEvent) => {
       spendingPubKey,
       spendingScalar,
     );
-    self.postMessage({ type: 'SUCCESS', results });
+    self.postMessage({ type: 'SUCCESS', results, nextLedger });
   } catch (err) {
+    const retentionGap = retentionGapFromError(err);
+    if (retentionGap) {
+      self.postMessage({ type: 'RETENTION_GAP', ...retentionGap });
+      return;
+    }
     self.postMessage({
       type: 'ERROR',
       error: err instanceof Error ? err.message : 'Scan failed in worker',

@@ -43,6 +43,7 @@ import { NetworkMismatchModal } from '@/components/NetworkMismatchModal';
 import { useStealthLabels } from '@/hooks/useStealthLabels';
 import { StellarBatchWithdrawModal } from '@/components/StellarBatchWithdrawModal';
 import { createStellarQrUri } from '@/utils/qr';
+import { readScanCursor, writeScanCursor, type RetentionGap } from '@/lib/stellar/scannerCursor';
 
 const ANNOUNCER_CONTRACT = 'CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL';
 const REGISTRY_CONTRACT = 'CC2LAUCXYOPJ4DV4CYXNXYAXRDVOTMAWFF76W4WFD5OVQBD6TN4PYYJ5';
@@ -699,6 +700,7 @@ export function StellarReceive() {
   }, []);
   const [hasScanned, setHasScanned] = useState(false);
   const [error, setError] = useState('');
+  const [retentionGap, setRetentionGap] = useState<RetentionGap | null>(null);
   const [showNetworkModal, setShowNetworkModal] = useState(false);
   const [retryStatus, setRetryStatus] = useState('');
   const [isRegistering, setIsRegistering] = useState(false);
@@ -724,15 +726,6 @@ export function StellarReceive() {
       return next;
     });
   }, []);
-
-  const toggleSelectAll = useCallback(() => {
-    setSelectedAddresses((prev) => {
-      if (prev.size === filteredMatched.length && filteredMatched.length > 0) {
-        return new Set();
-      }
-      return new Set(filteredMatched.map((m) => m.stealthAddress));
-    });
-  }, [filteredMatched]);
 
   const selectedMatches = useMemo(() => {
     return matched.filter((m) => selectedAddresses.has(m.stealthAddress));
@@ -814,6 +807,15 @@ export function StellarReceive() {
       return true;
     });
   }, [matched, labels, showHidden, searchQuery, activeTag]);
+
+  const toggleSelectAll = useCallback(() => {
+    setSelectedAddresses((prev) => {
+      if (prev.size === filteredMatched.length && filteredMatched.length > 0) {
+        return new Set();
+      }
+      return new Set(filteredMatched.map((m) => m.stealthAddress));
+    });
+  }, [filteredMatched]);
 
   const hiddenCount = useMemo(() => {
     return matched.filter((m) => labels[m.stealthAddress]?.hiddenAt).length;
@@ -1186,85 +1188,131 @@ export function StellarReceive() {
     }
   }, [stellarKeys, address, signTransaction]);
 
-  const scanPayments = useCallback(async () => {
-    if (!stellarKeys) return;
-    setIsScanning(true);
-    setError('');
+  const scanPayments = useCallback(
+    async (recoveryStartLedger?: number) => {
+      if (!stellarKeys) return;
+      setIsScanning(true);
+      setError('');
 
-    // Test hook: e2e/fixtures.ts injects a mock scan function on `window` so
-    // specs can control match results without real crypto. It runs on the
-    // main thread since a Worker doesn't share `window` with the page.
-    const mockScan = (window as any).scanAnnouncementsMock;
-    if (mockScan) {
-      try {
-        const announcements = await fetchAnnouncementEvents(
-          STELLAR_NETWORK.rpcUrl,
-          ANNOUNCER_CONTRACT,
-        );
-        const results = mockScan(
-          announcements,
-          stellarKeys.viewingKey,
-          stellarKeys.spendingPubKey,
-          stellarKeys.spendingScalar,
-        );
-        setMatched(results);
-        setHasScanned(true);
-        trackEvent('scan_triggered');
-      } catch (err) {
-        setError(err instanceof Error ? err.message : t('common.scanFailed'));
-      } finally {
+      // Test hook: e2e/fixtures.ts injects a mock scan function on `window` so
+      // specs can control match results without real crypto. It runs on the
+      // main thread since a Worker doesn't share `window` with the page.
+      const mockScan = (window as any).scanAnnouncementsMock;
+      if (mockScan) {
+        try {
+          const announcements = await fetchAnnouncementEvents(
+            STELLAR_NETWORK.rpcUrl,
+            ANNOUNCER_CONTRACT,
+          );
+          const results = mockScan(
+            announcements,
+            stellarKeys.viewingKey,
+            stellarKeys.spendingPubKey,
+            stellarKeys.spendingScalar,
+          );
+          setMatched(results);
+          setHasScanned(true);
+          trackEvent('scan_triggered');
+        } catch (err) {
+          setError(err instanceof Error ? err.message : t('common.scanFailed'));
+        } finally {
+          setIsScanning(false);
+        }
+        return;
+      }
+
+      // Restart cleanly: tear down any in-flight scan before starting a new
+      // one, so a strategy change always takes effect on the next scan without
+      // requiring a page reload.
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+      }
+
+      const worker = new Worker(new URL('../workers/stellar-scanner.worker.ts', import.meta.url), {
+        type: 'module',
+      });
+      workerRef.current = worker;
+
+      worker.onmessage = (event: MessageEvent) => {
+        const {
+          type,
+          results,
+          nextLedger,
+          requestedLedger,
+          oldestAvailableLedger,
+          error: workerError,
+        } = event.data ?? {};
+        if (type === 'SUCCESS') {
+          setMatched(results ?? []);
+          setHasScanned(true);
+          setRetentionGap(null);
+          if (address && Number.isSafeInteger(nextLedger)) {
+            writeScanCursor(localStorage, address, nextLedger);
+          }
+          trackEvent('scan_triggered');
+        } else if (type === 'RETENTION_GAP') {
+          setRetentionGap({ requestedLedger, oldestAvailableLedger });
+        } else {
+          setError(workerError || t('common.scanFailed'));
+        }
         setIsScanning(false);
-      }
-      return;
-    }
+        worker.terminate();
+        if (workerRef.current === worker) {
+          workerRef.current = null;
+        }
+      };
 
-    // Restart cleanly: tear down any in-flight scan before starting a new
-    // one, so a strategy change always takes effect on the next scan without
-    // requiring a page reload.
-    if (workerRef.current) {
-      workerRef.current.terminate();
-      workerRef.current = null;
-    }
+      worker.onerror = () => {
+        setError(t('common.scanFailed'));
+        setIsScanning(false);
+        worker.terminate();
+        if (workerRef.current === worker) {
+          workerRef.current = null;
+        }
+      };
 
-    const worker = new Worker(new URL('../workers/stellar-scanner.worker.ts', import.meta.url), {
-      type: 'module',
-    });
-    workerRef.current = worker;
+      worker.postMessage({
+        rpcUrl: STELLAR_NETWORK.rpcUrl,
+        announcerContract: ANNOUNCER_CONTRACT,
+        viewingKey: stellarKeys.viewingKey,
+        spendingPubKey: stellarKeys.spendingPubKey,
+        spendingScalar: stellarKeys.spendingScalar,
+        strategy: scanStrategy,
+        startLedger:
+          recoveryStartLedger ?? (address ? readScanCursor(localStorage, address) : undefined),
+      });
+    },
+    [stellarKeys, scanStrategy, address, t],
+  );
 
-    worker.onmessage = (event: MessageEvent) => {
-      const { type, results, error: workerError } = event.data ?? {};
-      if (type === 'SUCCESS') {
-        setMatched(results ?? []);
-        setHasScanned(true);
-        trackEvent('scan_triggered');
-      } else {
-        setError(workerError || t('common.scanFailed'));
-      }
-      setIsScanning(false);
-      worker.terminate();
-      if (workerRef.current === worker) {
-        workerRef.current = null;
+  useEffect(() => {
+    if (!('serviceWorker' in navigator)) return;
+    const handleServiceWorkerMessage = (event: MessageEvent) => {
+      const message = event.data ?? {};
+      if (message.publicKey !== address) return;
+      if (message.type === 'STELLAR_SCAN_RETENTION_GAP') {
+        setRetentionGap({
+          requestedLedger: message.requestedLedger,
+          oldestAvailableLedger: message.oldestAvailableLedger,
+        });
+      } else if (message.type === 'STELLAR_SCAN_RECOVERY_COMPLETE') {
+        setRetentionGap(null);
       }
     };
+    navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    return () => navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+  }, [address]);
 
-    worker.onerror = () => {
-      setError(t('common.scanFailed'));
-      setIsScanning(false);
-      worker.terminate();
-      if (workerRef.current === worker) {
-        workerRef.current = null;
-      }
-    };
-
-    worker.postMessage({
-      rpcUrl: STELLAR_NETWORK.rpcUrl,
-      announcerContract: ANNOUNCER_CONTRACT,
-      viewingKey: stellarKeys.viewingKey,
-      spendingPubKey: stellarKeys.spendingPubKey,
-      spendingScalar: stellarKeys.spendingScalar,
-      strategy: scanStrategy,
+  const recoverRetentionGap = useCallback(() => {
+    if (!retentionGap) return;
+    navigator.serviceWorker?.controller?.postMessage({
+      type: 'RECOVER_SCAN_CURSOR',
+      publicKey: address,
+      oldestAvailableLedger: retentionGap.oldestAvailableLedger,
     });
-  }, [stellarKeys, scanStrategy, t]);
+    void scanPayments(retentionGap.oldestAvailableLedger);
+  }, [address, retentionGap, scanPayments]);
 
   const handleToggleNotifications = useCallback(async () => {
     if (notifications.state.enabled) {
@@ -1381,10 +1429,12 @@ export function StellarReceive() {
         })}
         matchCount={matched.length}
         error={error}
+        retentionGap={retentionGap}
         retryStatus={retryStatus}
         onDeriveKeys={deriveKeysFromWallet}
         onRegister={registerOnChain}
-        onScan={scanPayments}
+        onScan={() => scanPayments()}
+        onRecoverRetentionGap={recoverRetentionGap}
         searchQuery={searchQuery}
         onSearchChange={setSearchQuery}
         filteredMatchCount={filteredMatched.length}

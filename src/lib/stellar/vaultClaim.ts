@@ -21,11 +21,92 @@ import {
 import type { Announcement } from '@wraith-protocol/sdk/chains/stellar';
 import { STELLAR_NETWORK } from '@/config';
 import { STELLAR_USDC } from '@/lib/stellar/assets';
+import {
+  isBoundedString,
+  isFiniteTimestamp,
+  readVersionedCollection,
+  writeVersioned,
+} from '@/lib/versionedStorage';
 
 /** Scheme ID the stealth-vault contract announces deposits under (distinct from the direct-transfer scheme). */
 export const VAULT_ANNOUNCE_SCHEME_ID = 2;
 
 const CONTRACT_ERROR_PATTERN = /Error\(Contract, #(\d+)\)/;
+const RECIPIENT_DEPOSIT_STORAGE_PREFIX = 'wraith:stellar-vault-recipient-deposits';
+
+type VaultStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+export interface PersistedRecipientVaultDeposit {
+  depositId: string;
+  recipient: string;
+  ephemeralPubKey: string;
+  metadata: string;
+  discoveredAt: number;
+}
+
+function isHex(value: string, byteLength?: number): boolean {
+  return (
+    value.length % 2 === 0 &&
+    (byteLength === undefined || value.length === byteLength * 2) &&
+    /^[0-9a-f]+$/i.test(value)
+  );
+}
+
+function isPersistedRecipientVaultDeposit(value: unknown): value is PersistedRecipientVaultDeposit {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Partial<PersistedRecipientVaultDeposit>;
+  return (
+    isBoundedString(record.depositId, 64) &&
+    isHex(record.depositId, 32) &&
+    isBoundedString(record.recipient, 56) &&
+    /^G[A-Z2-7]{55}$/.test(record.recipient) &&
+    isBoundedString(record.ephemeralPubKey, 64) &&
+    isHex(record.ephemeralPubKey, 32) &&
+    isBoundedString(record.metadata, 512) &&
+    isHex(record.metadata) &&
+    isFiniteTimestamp(record.discoveredAt)
+  );
+}
+
+export function recipientVaultStorageKey(
+  sourceAddress: string,
+  vaultContractId: string,
+  networkPassphrase: string,
+): string {
+  const networkId = sha256(Buffer.from(networkPassphrase)).subarray(0, 8).toString('hex');
+  return `${RECIPIENT_DEPOSIT_STORAGE_PREFIX}:${networkId}:${vaultContractId}:${sourceAddress}`;
+}
+
+export function loadPersistedRecipientVaultDeposits(
+  storage: VaultStorage,
+  sourceAddress: string,
+  vaultContractId: string,
+  networkPassphrase: string,
+): PersistedRecipientVaultDeposit[] {
+  return readVersionedCollection(
+    storage,
+    recipientVaultStorageKey(sourceAddress, vaultContractId, networkPassphrase),
+    isPersistedRecipientVaultDeposit,
+  );
+}
+
+function savePersistedRecipientVaultDeposits(
+  storage: VaultStorage,
+  sourceAddress: string,
+  vaultContractId: string,
+  networkPassphrase: string,
+  deposits: PersistedRecipientVaultDeposit[],
+): void {
+  writeVersioned(
+    storage,
+    recipientVaultStorageKey(sourceAddress, vaultContractId, networkPassphrase),
+    deposits,
+  );
+}
+
+function browserStorage(): VaultStorage | null {
+  return typeof localStorage === 'undefined' ? null : localStorage;
+}
 
 // Mirrors the VaultError enum documented in the stealth-vault contract README.
 const VAULT_ERROR_MESSAGES: Record<number, string> = {
@@ -53,6 +134,7 @@ export function decodeVaultError(message: string): string {
 export interface MatchedVaultAnnouncement {
   stealthAddress: string;
   ephemeralPubKey: string;
+  metadata: string;
   stealthPrivateScalar: bigint;
   stealthPubKeyBytes: Uint8Array;
 }
@@ -90,6 +172,7 @@ export function scanVaultAnnouncements(
       matched.push({
         stealthAddress: ann.stealthAddress,
         ephemeralPubKey: ann.ephemeralPubKey,
+        metadata: ann.metadata,
         stealthPrivateScalar: (spendingScalar + result.hashScalar) % L,
         stealthPubKeyBytes: result.stealthPubKeyBytes,
       });
@@ -232,7 +315,7 @@ export interface VaultDepositEntry {
  * the storage entry on both the claim and refund exit paths.
  */
 export async function getVaultDeposit(
-  soroban: rpc.Server,
+  soroban: { simulateTransaction(transaction: unknown): Promise<any> },
   readAccount: Account,
   networkPassphrase: string,
   vaultContractId: string,
@@ -315,11 +398,28 @@ export interface ClaimableVaultDeposit {
   stealthPubKeyBytes: Uint8Array;
 }
 
+type VaultClaimReadServer = {
+  getLatestLedger(): Promise<{ sequence: number }>;
+  getAccount(address: string): Promise<Account>;
+  simulateTransaction(transaction: unknown): Promise<any>;
+};
+
+function persistedRecordToAnnouncement(record: PersistedRecipientVaultDeposit): Announcement {
+  return {
+    schemeId: VAULT_ANNOUNCE_SCHEME_ID,
+    stealthAddress: record.recipient,
+    caller: record.recipient,
+    ephemeralPubKey: record.ephemeralPubKey,
+    metadata: record.metadata,
+  };
+}
+
 /**
- * Discovers deposits claimable by the connected recipient: scans announcer
- * events for vault-scheme matches, cross-references the vault's own `deposit`
- * events, and confirms each one's live state with `get_deposit` (already
- * claimed/refunded entries are dropped since the contract removes them).
+ * Discovers deposits claimable by the connected recipient. Public match data
+ * is persisted so active deposits remain discoverable after their announcement
+ * and deposit events leave the RPC retention window. Every candidate is
+ * confirmed with `get_deposit`; claimed/refunded entries are removed from the
+ * cache when the contract no longer returns them.
  */
 export async function loadClaimableVaultDeposits(params: {
   vaultContractId: string;
@@ -330,6 +430,9 @@ export async function loadClaimableVaultDeposits(params: {
   rpcUrl?: string;
   networkPassphrase?: string;
   fetchAnnouncementsFn?: () => Promise<Announcement[]>;
+  fetchDepositEventsFn?: () => Promise<VaultDepositEvent[]>;
+  server?: VaultClaimReadServer;
+  storage?: VaultStorage | null;
 }): Promise<{ deposits: ClaimableVaultDeposit[]; currentLedger: number }> {
   const {
     vaultContractId,
@@ -340,25 +443,45 @@ export async function loadClaimableVaultDeposits(params: {
     rpcUrl = STELLAR_NETWORK.rpcUrl,
     networkPassphrase = STELLAR_NETWORK.networkPassphrase,
     fetchAnnouncementsFn = () => fetchAnnouncements('stellar', rpcUrl),
+    fetchDepositEventsFn = () => fetchVaultDepositEvents(rpcUrl, vaultContractId),
+    server,
+    storage = browserStorage(),
   } = params;
 
-  const soroban = new rpc.Server(rpcUrl);
+  const soroban = server ?? new rpc.Server(rpcUrl);
+  const persisted = storage
+    ? loadPersistedRecipientVaultDeposits(
+        storage,
+        sourceAddress,
+        vaultContractId,
+        networkPassphrase,
+      )
+    : [];
 
   const [announcements, depositEvents, latestLedger, account] = await Promise.all([
     fetchAnnouncementsFn(),
-    fetchVaultDepositEvents(rpcUrl, vaultContractId),
+    fetchDepositEventsFn(),
     soroban.getLatestLedger(),
     soroban.getAccount(sourceAddress),
   ]);
 
   const currentLedger = latestLedger.sequence;
-  const matches = scanVaultAnnouncements(announcements, viewingKey, spendingPubKey, spendingScalar);
-  if (matches.length === 0) return { deposits: [], currentLedger };
+  const matches = scanVaultAnnouncements(
+    [...announcements, ...persisted.map(persistedRecordToAnnouncement)],
+    viewingKey,
+    spendingPubKey,
+    spendingScalar,
+  );
 
   const matchByAddress = new Map(matches.map((m) => [m.stealthAddress, m]));
+  const persistedById = new Map(persisted.map((record) => [record.depositId, record]));
+  const candidateIds = new Set([
+    ...depositEvents.map((event) => event.depositId),
+    ...persisted.map((record) => record.depositId),
+  ]);
   const deposits: ClaimableVaultDeposit[] = [];
 
-  for (const event of depositEvents) {
+  for (const depositId of candidateIds) {
     const readAccount = new Account(account.accountId(), account.sequenceNumber());
     let entry: VaultDepositEntry | null;
     try {
@@ -367,20 +490,31 @@ export async function loadClaimableVaultDeposits(params: {
         readAccount,
         networkPassphrase,
         vaultContractId,
-        event.depositId,
+        depositId,
       );
     } catch {
       continue;
     }
-    if (!entry) continue;
+    if (!entry) {
+      persistedById.delete(depositId);
+      continue;
+    }
 
     const match = matchByAddress.get(entry.recipient);
     if (!match) continue;
 
+    persistedById.set(depositId, {
+      depositId,
+      recipient: entry.recipient,
+      ephemeralPubKey: match.ephemeralPubKey,
+      metadata: match.metadata,
+      discoveredAt: persistedById.get(depositId)?.discoveredAt ?? Date.now(),
+    });
+
     const { label, decimals } = describeVaultAsset(entry.asset, networkPassphrase);
 
     deposits.push({
-      depositId: event.depositId,
+      depositId,
       recipient: entry.recipient,
       sender: entry.sender,
       amount: entry.amount,
@@ -393,6 +527,16 @@ export async function loadClaimableVaultDeposits(params: {
       stealthPrivateScalar: match.stealthPrivateScalar,
       stealthPubKeyBytes: match.stealthPubKeyBytes,
     });
+  }
+
+  if (storage) {
+    savePersistedRecipientVaultDeposits(
+      storage,
+      sourceAddress,
+      vaultContractId,
+      networkPassphrase,
+      Array.from(persistedById.values()),
+    );
   }
 
   return { deposits, currentLedger };

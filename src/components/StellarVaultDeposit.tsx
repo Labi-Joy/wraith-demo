@@ -3,10 +3,15 @@ import { decodeStealthMetaAddress } from '@wraith-protocol/sdk/chains/stellar';
 import { useStellarWallet } from '@/context/StellarWalletContext';
 import { CopyButton } from '@/components/CopyButton';
 import { StellarLink } from '@/components/StellarLink';
+import {
+  getVaultContractId,
+  submitVaultDeposit,
+  type VaultDepositProgress,
+} from '@/lib/stellar/vaultDeposit';
 
 const MIN_XLM_AMOUNT = 0.0000001;
 
-type DepositState = 'idle' | 'pending' | 'success';
+type DepositState = 'idle' | 'simulating' | 'signing' | 'pending' | 'success' | 'failure';
 
 function validateMetaAddress(value: string) {
   if (!value) return 'Recipient meta-address is required';
@@ -54,7 +59,7 @@ function validateRefundWindow(value: string) {
 }
 
 export function StellarVaultDeposit() {
-  const { address } = useStellarWallet();
+  const { address, signTransaction, isNetworkMismatch } = useStellarWallet();
   const [recipient, setRecipient] = useState('');
   const [amount, setAmount] = useState('');
   const [unlockLedger, setUnlockLedger] = useState('');
@@ -70,6 +75,10 @@ export function StellarVaultDeposit() {
   const [depositState, setDepositState] = useState<DepositState>('idle');
   const [depositId, setDepositId] = useState<string | null>(null);
   const [txHash, setTxHash] = useState<string | null>(null);
+  const [simulationFee, setSimulationFee] = useState<string | null>(null);
+
+  const contractId = getVaultContractId();
+  const isProcessing = ['simulating', 'signing', 'pending'].includes(depositState);
 
   const metaAddress = recipient.trim();
   const amountValue = amount.trim();
@@ -95,7 +104,8 @@ export function StellarVaultDeposit() {
     !!unlockLedgerValue &&
     !!refundWindowValue &&
     !validationError &&
-    depositState !== 'pending';
+    !!contractId &&
+    !isProcessing;
 
   const handleDeposit = useCallback(async () => {
     setSubmitAttempted(true);
@@ -106,29 +116,38 @@ export function StellarVaultDeposit() {
       return;
     }
 
+    if (isNetworkMismatch) {
+      setError('Switch Freighter to Stellar Testnet before creating a deposit');
+      setDepositState('failure');
+      return;
+    }
+
     if (!canSubmit) {
       setError(validationError || 'Enter valid deposit details');
       return;
     }
 
     setError('');
-    setDepositState('pending');
+    setDepositState('simulating');
 
     try {
-      // TODO: Integrate with stealth-vault contract when available
-      // For now, simulate the deposit flow
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-
-      // Simulate deposit ID and transaction hash
-      const simulatedDepositId = `vault_${Date.now()}`;
-      const simulatedTxHash = `${simulatedDepositId}_tx`;
-
-      setDepositId(simulatedDepositId);
-      setTxHash(simulatedTxHash);
-      setDepositState('success');
+      const deposit = await submitVaultDeposit({
+        sender: address,
+        metaAddress,
+        amount: amountValue,
+        unlockLedger: Number(unlockLedgerValue),
+        refundWindow: Number(refundWindowValue),
+        signTransaction,
+        onProgress: (progress: VaultDepositProgress) => {
+          setDepositState(progress.status);
+          if (progress.status === 'signing') setSimulationFee(progress.fee);
+          if ('txHash' in progress) setTxHash(progress.txHash);
+        },
+      });
+      setDepositId(deposit.depositId);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Deposit failed');
-      setDepositState('idle');
+      setDepositState('failure');
     }
   }, [
     address,
@@ -138,6 +157,8 @@ export function StellarVaultDeposit() {
     refundWindowValue,
     canSubmit,
     validationError,
+    isNetworkMismatch,
+    signTransaction,
   ]);
 
   const reset = () => {
@@ -149,13 +170,14 @@ export function StellarVaultDeposit() {
     setTxHash(null);
     setDepositState('idle');
     setError('');
+    setSimulationFee(null);
     setTouched({ recipient: false, amount: false, unlockLedger: false, refundWindow: false });
     setSubmitAttempted(false);
   };
 
   return (
     <div className="flex flex-col gap-6">
-      {depositState === 'idle' && (
+      {depositState !== 'success' && (
         <>
           <div className="flex flex-col gap-1.5">
             <label className="font-mono text-[10px] uppercase tracking-widest text-outline">
@@ -248,19 +270,47 @@ export function StellarVaultDeposit() {
                 Contract
               </span>
               <span className="font-mono text-[10px] text-on-surface-variant">
-                Stealth Vault (Coming Soon)
+                {contractId
+                  ? `${contractId.slice(0, 8)}...${contractId.slice(-6)}`
+                  : 'Not configured'}
               </span>
             </div>
           </div>
 
-          {error && <p className="text-sm text-error">{error}</p>}
+          {isProcessing && (
+            <div className="border border-primary/40 bg-primary/5 p-3" aria-live="polite">
+              <p className="font-mono text-xs uppercase tracking-widest text-primary">
+                {depositState === 'simulating' && 'Simulating on Stellar Testnet...'}
+                {depositState === 'signing' && 'Awaiting wallet signature...'}
+                {depositState === 'pending' && 'Transaction pending on-chain...'}
+              </p>
+              {simulationFee && depositState !== 'simulating' && (
+                <p className="mt-1 font-mono text-[10px] text-on-surface-variant">
+                  Simulated resource fee: {simulationFee} stroops
+                </p>
+              )}
+            </div>
+          )}
+
+          {depositState === 'failure' && error && (
+            <div className="border border-error/40 bg-error/5 p-3" role="alert">
+              <p className="font-mono text-xs uppercase tracking-widest text-error">
+                Deposit failed
+              </p>
+              <p className="mt-1 text-sm text-error">{error}</p>
+            </div>
+          )}
 
           <button
             onClick={handleDeposit}
             disabled={!canSubmit}
             className="h-12 w-full bg-primary font-heading text-[13px] font-semibold uppercase tracking-widest text-surface transition-colors hover:brightness-110 disabled:opacity-30"
           >
-            {'Create Deposit'}
+            {isProcessing
+              ? 'Processing...'
+              : depositState === 'failure'
+                ? 'Retry Deposit'
+                : 'Create Deposit'}
           </button>
         </>
       )}

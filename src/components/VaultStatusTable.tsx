@@ -1,150 +1,56 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState } from 'react';
 import { CopyButton } from '@/components/CopyButton';
-import { useStellarWallet } from '@/context/StellarWalletContext';
 import { StellarLink } from '@/components/StellarLink';
-
-type DepositState = 'pending' | 'claimed' | 'refunded';
-
-interface VaultDeposit {
-  id: string;
-  recipient: string;
-  amount: string;
-  unlockLedger: number;
-  refundWindow: number;
-  state: DepositState;
-  createdAt: number;
-}
-
-// Mock deposit data - will be replaced with contract calls
-const MOCK_DEPOSITS: VaultDeposit[] = [
-  {
-    id: 'vault_1234567890',
-    recipient: 'st:xlm:mock_recipient_1',
-    amount: '10.5',
-    unlockLedger: 500000,
-    refundWindow: 10000,
-    state: 'pending',
-    createdAt: Date.now() - 86400000, // 1 day ago
-  },
-  {
-    id: 'vault_9876543210',
-    recipient: 'st:xlm:mock_recipient_2',
-    amount: '25.0',
-    unlockLedger: 450000,
-    refundWindow: 10000,
-    state: 'claimed',
-    createdAt: Date.now() - 172800000, // 2 days ago
-  },
-  {
-    id: 'vault_5555555555',
-    recipient: 'st:xlm:mock_recipient_3',
-    amount: '5.0',
-    unlockLedger: 400000,
-    refundWindow: 10000,
-    state: 'refunded',
-    createdAt: Date.now() - 259200000, // 3 days ago
-  },
-];
-
-// Mock current ledger - will be replaced with actual ledger query
-const MOCK_CURRENT_LEDGER = 480000;
+import { useStealthKeys } from '@/context/StealthKeysContext';
+import { useStellarWallet } from '@/context/StellarWalletContext';
+import { useVaultDeposits } from '@/hooks/useVaultDeposits';
+import {
+  deriveVaultClaimSigner,
+  getVaultActions,
+  submitVaultAction,
+  type OnChainVaultDeposit,
+  type VaultDepositState,
+} from '@/lib/stellar/vaultStatus';
 
 function formatCountdown(targetLedger: number, currentLedger: number): string {
-  const ledgersRemaining = targetLedger - currentLedger;
-  if (ledgersRemaining <= 0) return 'Unlocked';
-
-  // Approximate: ~5 seconds per ledger on Stellar
-  const secondsRemaining = ledgersRemaining * 5;
-  const hours = Math.floor(secondsRemaining / 3600);
-  const minutes = Math.floor((secondsRemaining % 3600) / 60);
-
-  if (hours > 24) {
-    const days = Math.floor(hours / 24);
-    return `${days}d ${hours % 24}h`;
-  }
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
+  const ledgers = targetLedger - currentLedger;
+  if (ledgers <= 0) return 'Reached';
+  const minutes = Math.ceil((ledgers * 5) / 60);
+  if (minutes >= 1440)
+    return `${Math.floor(minutes / 1440)}d ${Math.floor((minutes % 1440) / 60)}h`;
+  if (minutes >= 60) return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
   return `${minutes}m`;
 }
 
-function getStateColor(state: DepositState): string {
-  switch (state) {
-    case 'pending':
-      return 'bg-primary';
-    case 'claimed':
-      return 'bg-tertiary';
-    case 'refunded':
-      return 'bg-outline';
-    default:
-      return 'bg-outline';
-  }
-}
+const stateLabels: Record<VaultDepositState, string> = {
+  pending: 'Pending',
+  claimable: 'Claimable',
+  expired: 'Expired',
+  claimed: 'Claimed',
+  refunded: 'Refunded',
+  failed: 'Failed',
+};
 
-function getStateLabel(state: DepositState): string {
-  switch (state) {
-    case 'pending':
-      return 'Pending';
-    case 'claimed':
-      return 'Claimed';
-    case 'refunded':
-      return 'Refunded';
-    default:
-      return 'Unknown';
-  }
-}
+const stateColors: Record<VaultDepositState, string> = {
+  pending: 'bg-primary',
+  claimable: 'bg-tertiary',
+  expired: 'bg-error',
+  claimed: 'bg-tertiary',
+  refunded: 'bg-outline',
+  failed: 'bg-error',
+};
 
 export function VaultStatusTable() {
-  const { address } = useStellarWallet();
-  const [deposits, setDeposits] = useState<VaultDeposit[]>(MOCK_DEPOSITS);
-  const [currentLedger, setCurrentLedger] = useState(MOCK_CURRENT_LEDGER);
-  const [, setTick] = useState(0);
-  const [refundingId, setRefundingId] = useState<string | null>(null);
-  const [refundError, setRefundError] = useState('');
-  const [refundTxHash, setRefundTxHash] = useState<string | null>(null);
-
-  // Update countdown every minute
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setTick((prev) => prev + 1);
-      // Simulate ledger progression
-      setCurrentLedger((prev) => prev + 12); // ~1 minute worth of ledgers
-    }, 60000);
-
-    return () => clearInterval(interval);
-  }, []);
-
-  const handleRefund = useCallback(
-    async (depositId: string) => {
-      if (!address) {
-        setRefundError('Wallet not connected');
-        return;
-      }
-
-      setRefundingId(depositId);
-      setRefundError('');
-
-      try {
-        // TODO: Integrate with stealth-vault contract when available
-        // For now, simulate the refund flow
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-
-        // Simulate transaction hash
-        const simulatedTxHash = `refund_${depositId}_${Date.now()}`;
-        setRefundTxHash(simulatedTxHash);
-
-        // Update deposit state
-        setDeposits((prev) =>
-          prev.map((d) => (d.id === depositId ? { ...d, state: 'refunded' as const } : d)),
-        );
-      } catch (err) {
-        setRefundError(err instanceof Error ? err.message : 'Refund failed');
-      } finally {
-        setRefundingId(null);
-      }
-    },
-    [address],
+  const { address, signTransaction, freighterNetwork, isNetworkMismatch } = useStellarWallet();
+  const { stellarKeys } = useStealthKeys();
+  const { deposits, currentLedger, loading, error, refresh } = useVaultDeposits(
+    address,
+    freighterNetwork,
+    stellarKeys,
   );
+  const [actionId, setActionId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState('');
+  const [txHash, setTxHash] = useState<string | null>(null);
 
   if (!address) {
     return (
@@ -159,38 +65,48 @@ export function VaultStatusTable() {
     );
   }
 
-  if (deposits.length === 0) {
-    return (
-      <div className="py-12 text-center">
-        <p className="font-heading text-sm uppercase tracking-widest text-outline">No Deposits</p>
-        <p className="mt-2 font-body text-xs text-on-surface-variant">No vault deposits found.</p>
-      </div>
-    );
-  }
+  const runAction = async (action: 'claim' | 'refund', deposit: OnChainVaultDeposit) => {
+    if (isNetworkMismatch) {
+      setActionError('Switch Freighter to Stellar Testnet before continuing');
+      return;
+    }
+    setActionId(deposit.id);
+    setActionError('');
+    try {
+      const claimSigner = action === 'claim' ? deriveVaultClaimSigner(deposit, stellarKeys) : null;
+      if (action === 'claim' && !claimSigner) {
+        throw new Error('This vault deposit does not match the derived stealth key');
+      }
+      const hash = await submitVaultAction({
+        action,
+        depositId: deposit.id,
+        actor: address,
+        signTransaction,
+        ...(claimSigner ? { claimSigner } : {}),
+      });
+      setTxHash(hash);
+      await refresh();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : `Vault ${action} failed`);
+    } finally {
+      setActionId(null);
+    }
+  };
 
   return (
     <div className="flex flex-col gap-4">
-      {refundError && <p className="text-sm text-error">{refundError}</p>}
-
-      {refundTxHash && (
-        <div className="flex flex-col gap-3 border border-tertiary bg-tertiary/5 p-4">
-          <div className="flex items-center gap-2">
-            <span className="inline-block h-1.5 w-1.5 bg-tertiary"></span>
-            <span className="font-heading text-xs font-semibold uppercase tracking-widest text-tertiary">
-              Refund Successful
-            </span>
-          </div>
-          <div>
-            <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-              Transaction Hash
-            </span>
-            <StellarLink
-              value={refundTxHash}
-              type="tx"
-              className="mt-0.5 max-w-full"
-              linkClassName="text-xs"
-            />
-          </div>
+      {(error || actionError) && <p className="text-sm text-error">{actionError || error}</p>}
+      {txHash && (
+        <div className="border border-tertiary bg-tertiary/5 p-4">
+          <p className="font-heading text-xs font-semibold uppercase tracking-widest text-tertiary">
+            Transaction Confirmed
+          </p>
+          <StellarLink
+            value={txHash}
+            type="tx"
+            className="mt-2 max-w-full"
+            linkClassName="text-xs"
+          />
         </div>
       )}
 
@@ -199,139 +115,113 @@ export function VaultStatusTable() {
           Current Ledger
         </span>
         <span className="font-mono text-xs text-on-surface-variant">
-          {currentLedger.toLocaleString()}
+          {currentLedger ? currentLedger.toLocaleString() : loading ? 'Loading...' : 'Unavailable'}
         </span>
       </div>
 
-      <div className="flex flex-col gap-3">
-        {deposits.map((deposit) => {
-          const unlockCountdown = formatCountdown(deposit.unlockLedger, currentLedger);
-          const refundDeadline = deposit.unlockLedger + deposit.refundWindow;
-          const refundCountdown = formatCountdown(refundDeadline, currentLedger);
-          const isUnlocked = currentLedger >= deposit.unlockLedger;
-          const canRefund = currentLedger >= refundDeadline && deposit.state === 'pending';
+      {!loading && deposits.length === 0 && !error && (
+        <div className="py-12 text-center">
+          <p className="font-heading text-sm uppercase tracking-widest text-outline">No Deposits</p>
+          <p className="mt-2 font-body text-xs text-on-surface-variant">
+            No on-chain vault deposits found in the retained ledger range.
+          </p>
+        </div>
+      )}
 
-          return (
-            <div
-              key={deposit.id}
-              className="flex flex-col gap-3 border border-outline-variant bg-surface-container p-4"
-            >
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0 flex-1">
-                  <div className="mb-2 flex items-center gap-2">
-                    <span
-                      className={`inline-block h-1.5 w-1.5 ${getStateColor(deposit.state)}`}
-                    ></span>
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                      {getStateLabel(deposit.state)}
-                    </span>
-                  </div>
-
-                  <div className="mb-2">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                      Deposit ID
-                    </span>
-                    <div className="mt-0.5 flex items-center gap-2">
-                      <span className="font-mono text-xs text-primary">{deposit.id}</span>
-                      <CopyButton text={deposit.id} />
-                    </div>
-                  </div>
-
-                  <div className="mb-2">
-                    <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                      Amount
-                    </span>
-                    <div className="mt-0.5 font-heading text-base font-bold text-on-surface">
-                      {deposit.amount} XLM
-                    </div>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                        Unlock Ledger
-                      </span>
-                      <div className="mt-0.5 font-mono text-xs text-on-surface-variant">
-                        {deposit.unlockLedger.toLocaleString()}
-                      </div>
-                    </div>
-
-                    <div>
-                      <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                        Time to Unlock
-                      </span>
-                      <div className="mt-0.5 font-mono text-xs text-on-surface-variant">
-                        {unlockCountdown}
-                      </div>
-                    </div>
-
-                    <div>
-                      <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                        Refund Deadline
-                      </span>
-                      <div className="mt-0.5 font-mono text-xs text-on-surface-variant">
-                        {refundDeadline.toLocaleString()}
-                      </div>
-                    </div>
-
-                    <div>
-                      <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
-                        Refund Window
-                      </span>
-                      <div className="mt-0.5 font-mono text-xs text-on-surface-variant">
-                        {refundCountdown}
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {deposit.state === 'pending' && (
-                <div className="border-t border-outline-variant/30 pt-3">
-                  {isUnlocked && !canRefund && (
-                    <p className="font-body text-xs text-tertiary">
-                      Unlock time reached. Recipient can now claim.
-                    </p>
-                  )}
-                  {canRefund && (
-                    <div className="flex flex-col gap-2">
-                      <p className="font-body text-xs text-error">
-                        Refund window open. Sender can now refund.
-                      </p>
-                      <button
-                        onClick={() => handleRefund(deposit.id)}
-                        disabled={refundingId === deposit.id}
-                        className="h-11 w-full border border-error bg-error/5 font-heading text-[13px] font-semibold uppercase tracking-widest text-error transition-colors hover:bg-error/10 disabled:opacity-30"
-                      >
-                        {refundingId === deposit.id ? 'Refunding...' : 'Refund'}
-                      </button>
-                    </div>
-                  )}
-                  {!isUnlocked && (
-                    <p className="font-body text-xs text-on-surface-variant">
-                      Waiting for unlock time...
-                    </p>
-                  )}
-                </div>
-              )}
-
-              {deposit.state === 'claimed' && (
-                <div className="border-t border-outline-variant/30 pt-3">
-                  <p className="font-body text-xs text-tertiary">
-                    Successfully claimed by recipient.
-                  </p>
-                </div>
-              )}
-
-              {deposit.state === 'refunded' && (
-                <div className="border-t border-outline-variant/30 pt-3">
-                  <p className="font-body text-xs text-outline">Refunded by sender.</p>
-                </div>
-              )}
+      {deposits.map((deposit) => {
+        const actions = getVaultActions(deposit, address, stellarKeys);
+        return (
+          <div
+            key={deposit.id}
+            className="flex flex-col gap-3 border border-outline-variant bg-surface-container p-4"
+          >
+            <div className="flex items-center gap-2">
+              <span className={`inline-block h-1.5 w-1.5 ${stateColors[deposit.state]}`} />
+              <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
+                {stateLabels[deposit.state]}
+              </span>
             </div>
-          );
-        })}
-      </div>
+
+            <div>
+              <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
+                Deposit ID
+              </span>
+              <div className="mt-0.5 flex items-center gap-2">
+                <span className="truncate font-mono text-xs text-primary">{deposit.id}</span>
+                <CopyButton text={deposit.id} />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
+                  Amount
+                </span>
+                <p className="font-heading text-base font-bold text-on-surface">
+                  {deposit.amount} XLM
+                </p>
+              </div>
+              <div>
+                <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
+                  Unlock Ledger
+                </span>
+                <p className="font-mono text-xs text-on-surface-variant">
+                  {deposit.unlockLedger ? deposit.unlockLedger.toLocaleString() : 'Unavailable'}
+                </p>
+              </div>
+              <div>
+                <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
+                  Time to Unlock
+                </span>
+                <p className="font-mono text-xs text-on-surface-variant">
+                  {deposit.unlockLedger
+                    ? formatCountdown(deposit.unlockLedger, currentLedger)
+                    : 'Unavailable'}
+                </p>
+              </div>
+              <div>
+                <span className="font-mono text-[10px] uppercase tracking-widest text-outline">
+                  Refund Ledger
+                </span>
+                <p className="font-mono text-xs text-on-surface-variant">
+                  {deposit.refundAfter ? deposit.refundAfter.toLocaleString() : 'Unavailable'}
+                </p>
+              </div>
+            </div>
+
+            {actions.canClaim && (
+              <button
+                onClick={() => void runAction('claim', deposit)}
+                disabled={actionId === deposit.id}
+                className="h-11 w-full bg-primary font-heading text-[13px] font-semibold uppercase tracking-widest text-surface disabled:opacity-30"
+              >
+                {actionId === deposit.id ? 'Claiming...' : 'Claim'}
+              </button>
+            )}
+            {actions.canRefund && (
+              <button
+                onClick={() => void runAction('refund', deposit)}
+                disabled={actionId === deposit.id}
+                className="h-11 w-full border border-error bg-error/5 font-heading text-[13px] font-semibold uppercase tracking-widest text-error disabled:opacity-30"
+              >
+                {actionId === deposit.id ? 'Refunding...' : 'Refund'}
+              </button>
+            )}
+
+            {deposit.state === 'claimed' && (
+              <p className="text-xs text-tertiary">Claimed by recipient.</p>
+            )}
+            {deposit.state === 'refunded' && (
+              <p className="text-xs text-outline">Refunded to sender.</p>
+            )}
+            {deposit.state === 'failed' && (
+              <p className="text-xs text-error">
+                Contract state could not be resolved for this deposit.
+              </p>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }

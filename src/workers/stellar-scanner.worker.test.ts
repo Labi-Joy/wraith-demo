@@ -51,6 +51,11 @@ function mockGetEventsResponse(events: ReturnType<typeof buildEventEntry>[]) {
     'fetch',
     vi.fn(async (_url: string, init?: RequestInit) => {
       const body = JSON.parse((init?.body as string) ?? '{}');
+      if (body.method === 'getLatestLedger') {
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { sequence: 500 } }),
+        );
+      }
       if (body.method !== 'getEvents') {
         return new Response(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: {} }));
       }
@@ -205,10 +210,53 @@ describe('stellar-scanner worker message contract', () => {
       strategy: 'balanced',
     });
 
-    // fetchAnnouncementEvents swallows fetch errors and returns an empty
-    // list, so a scan still completes successfully with zero matches rather
-    // than surfacing an ERROR — confirm that resilience explicitly.
-    expect(result.type).toBe('SUCCESS');
-    expect(result.results).toHaveLength(0);
+    expect(result.type).toBe('ERROR');
+    expect(result.error).toBe('network down');
+  });
+
+  it('reports an expired cursor and only advances it after an explicit recovery scan', async () => {
+    await import('./stellar-scanner.worker');
+    const requestedStartLedgers: number[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: string, init?: RequestInit) => {
+        const body = JSON.parse((init?.body as string) ?? '{}');
+        if (body.method === 'getLatestLedger') {
+          return new Response(JSON.stringify({ result: { sequence: 500 } }));
+        }
+
+        const startLedger = body.params?.startLedger;
+        if (startLedger === 1) {
+          return new Response(
+            JSON.stringify({
+              error: { message: 'startLedger must be within the ledger range: 250 - 500' },
+            }),
+          );
+        }
+        requestedStartLedgers.push(startLedger);
+        return new Response(JSON.stringify({ result: { events: [] } }));
+      }),
+    );
+
+    const message = {
+      rpcUrl: RPC_URL,
+      announcerContract: CONTRACT_ID,
+      viewingKey: recipient.viewingKey,
+      spendingPubKey: recipient.spendingPubKey,
+      spendingScalar: recipient.spendingScalar,
+      strategy: 'balanced',
+    };
+    const expired = await postAndWaitForResult({ ...message, startLedger: 100 });
+
+    expect(expired).toEqual({
+      type: 'RETENTION_GAP',
+      requestedLedger: 100,
+      oldestAvailableLedger: 250,
+    });
+    expect(requestedStartLedgers).toEqual([]);
+
+    const recovered = await postAndWaitForResult({ ...message, startLedger: 250 });
+    expect(recovered).toEqual({ type: 'SUCCESS', results: [], nextLedger: 501 });
+    expect(requestedStartLedgers).toEqual([250]);
   });
 });

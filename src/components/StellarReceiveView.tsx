@@ -6,6 +6,7 @@ import { StellarPaymentLink } from '@/components/StellarPaymentLink';
 import { ImportConflictModal } from '@/components/ImportConflictModal';
 import { EmptyState } from '@/components/EmptyState';
 import type { ImportResult } from '@/lib/stealthLabels';
+import type { RetentionGap } from '@/lib/stellar/scannerCursor';
 
 export interface StellarReceiveViewProps {
   isConnected: boolean;
@@ -22,10 +23,12 @@ export interface StellarReceiveViewProps {
   matchCount: number;
   matches: ReactNode;
   error: string;
+  retentionGap?: RetentionGap | null;
   retryStatus?: string;
   onDeriveKeys: () => void;
   onRegister: () => void;
   onScan: () => void;
+  onRecoverRetentionGap?: () => void;
   searchQuery?: string;
   onSearchChange?: (value: string) => void;
   filteredMatchCount?: number;
@@ -65,10 +68,12 @@ export function StellarReceiveView({
   matchCount,
   matches,
   error,
+  retentionGap,
   retryStatus = '',
   onDeriveKeys,
   onRegister,
   onScan,
+  onRecoverRetentionGap,
   searchQuery,
   onSearchChange,
   filteredMatchCount,
@@ -316,6 +321,28 @@ export function StellarReceiveView({
           </div>
 
           {retryStatus && <p className="text-sm text-on-surface-variant">{retryStatus}</p>}
+          {retentionGap && (
+            <div
+              role="alert"
+              className="border border-warning bg-surface-container p-4 text-sm text-on-surface"
+            >
+              <p className="font-heading text-xs font-semibold uppercase tracking-widest text-warning">
+                Scan history expired
+              </p>
+              <p className="mt-2 font-body leading-relaxed text-on-surface-variant">
+                Ledgers {retentionGap.requestedLedger} through{' '}
+                {retentionGap.oldestAvailableLedger - 1} are no longer available from the RPC. Any
+                payments in that range may have been missed.
+              </p>
+              <button
+                type="button"
+                onClick={onRecoverRetentionGap}
+                className="mt-3 h-10 border border-warning px-4 font-heading text-[11px] font-semibold uppercase tracking-widest text-warning transition-colors hover:bg-surface-bright"
+              >
+                Rescan from ledger {retentionGap.oldestAvailableLedger}
+              </button>
+            </div>
+          )}
           {error && <p className="text-sm text-error">{error}</p>}
 
           {/* Search, filter, and toolbar */}
