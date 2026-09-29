@@ -31,7 +31,7 @@ jobs:
         # ambiguity in `stellar.spec.ts`, unrouted requests in the vault
         # specs, etc). Chromium-only keeps the run tight; the full
         # multi-browser matrix stays available locally via `pnpm test:e2e`.
-        run: pnpm exec playwright test e2e/send-failure-matrix.spec.ts --project=chromium
+        run: pnpm exec playwright test e2e/send-failure-matrix.spec.ts e2e/flows-failure-matrix.spec.ts --project=chromium
 
       - name: Upload Playwright report on failure
         if: failure()

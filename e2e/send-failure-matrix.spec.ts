@@ -20,7 +20,7 @@ import { test, expect } from './fixtures';
 const MOCK_ADDRESS = 'GCDURJMLJBNVUVWXZ7UBXEIAEC4ONEWPWK6KDUUSDTUJJGXCSMBC2XHX';
 const RECIPIENT_META =
   'st:xlm:5a1922b5614eed2ef72ebad40abc5d014f7c27b6e1de5dc36976e9eec4cbe29e6b912a495f9f14513d54a00a7887f986d394a30a77239475caf211e8094b6cdb';
-const USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NOATFQRAHX4JHPX';
+const USDC_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
 
 const senderAccountUrl = `https://horizon-testnet.stellar.org/accounts/${MOCK_ADDRESS}`;
 
@@ -99,14 +99,17 @@ test.describe('Send failure matrix (issue #187)', () => {
     // Retry backoff is exponential with jitter; three 503s + the 500ms
     // debounce comfortably fit in 6s.
     await expect(() => expect(attempts).toBeGreaterThanOrEqual(3)).toPass({ timeout: 10_000 });
-    // Small settle window so React can flush `setBalanceLookupError` from
-    // the effect's catch block before the click reads `validationError`.
-    await page.waitForTimeout(300);
 
-    await page.getByRole('button', { name: 'Send Privately' }).click();
-    await expect(page.getByText(/Connection failed after 3 attempts/)).toBeVisible({
-      timeout: 5000,
-    });
+    // Retry-until-visible pattern: React needs a few ticks to commit
+    // `setBalanceLookupError` after the effect's catch, and `useCallback`
+    // must then re-memoize `handleSend` with the fresh `validationError`.
+    // Waiting a fixed delay is race-prone under CI load, so poll instead.
+    await expect(async () => {
+      await page.getByRole('button', { name: 'Send Privately' }).click();
+      await expect(page.getByText(/Connection failed after 3 attempts/)).toBeVisible({
+        timeout: 500,
+      });
+    }).toPass({ timeout: 10_000 });
   });
 
   test('3. Wrong network — opens the network-mismatch modal and blocks the submit', async ({
@@ -153,14 +156,7 @@ test.describe('Send failure matrix (issue #187)', () => {
     await expect(page.getByText(/Insufficient XLM/)).toBeVisible();
   });
 
-  // Skipped: the USDC issuer hardcoded in `src/lib/stellar/assets.ts`
-  // (`GBBD47IF...HX4JHPX`) fails `StrKey.isValidEd25519PublicKey`, so
-  // `getAssetByKey('USDC').toAsset()` throws `Issuer is invalid` and the
-  // whole USDC path — including the trustline check we want to exercise —
-  // is unreachable. Fixing the placeholder issuer is a separate change from
-  // failure-path coverage; see the PR body for the pointer. Re-enable this
-  // test once the issuer is a real testnet key.
-  test.skip('5. Missing trustline — surfaces recipient-trustline CTA after Send is attempted', async ({
+  test('5. Missing trustline — surfaces recipient-trustline CTA after Send is attempted', async ({
     page,
     freighter,
     horizon,
