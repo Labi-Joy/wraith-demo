@@ -155,7 +155,36 @@ test.describe('Schedule failure matrix (issue #187)', () => {
 // the on-chain contract is pending.
 
 test.describe('Vault failure matrix (issue #187)', () => {
-  test('Wrong network on Claim opens the network-mismatch modal', async ({
+  // Assertions run against the Deposit tab (default), which is the vault
+  // surface that reaches the wallet directly. The Claim tab now requires a
+  // full derive-keys + scan-contract precondition before a Claim button
+  // exists; exercising that whole chain is a follow-up spec.
+
+  const RECIPIENT = RECIPIENT_META;
+  const VALID_AMOUNT = '5';
+  const VALID_UNLOCK = '100000';
+  const VALID_REFUND = '10000';
+
+  async function fillDepositForm(page: import('@playwright/test').Page): Promise<void> {
+    await page.getByPlaceholder('st:xlm:...').fill(RECIPIENT);
+    await page.getByPlaceholder('0.0').fill(VALID_AMOUNT);
+    await page.getByPlaceholder('e.g., 100000', { exact: true }).fill(VALID_UNLOCK);
+    await page.getByPlaceholder('e.g., 10000', { exact: true }).fill(VALID_REFUND);
+  }
+
+  // The Deposit form gates its submit button on `getVaultContractId()`. In a
+  // deployed build that reads from either `VITE_STELLAR_VAULT_CONTRACT_ID`
+  // or `window.__WRAITH_CONFIG__`; the e2e environment sets neither, so the
+  // submit button stays disabled forever without this init script.
+  async function injectVaultContract(page: import('@playwright/test').Page): Promise<void> {
+    await page.addInitScript(() => {
+      (window as unknown as { __WRAITH_CONFIG__: Record<string, string> }).__WRAITH_CONFIG__ = {
+        stellarVaultContractId: 'CAV4LTHU7BJZL7XPCF6NZ4CPZW3DFI74LB57L4HAZ5NZAFYFJIWKM2LU',
+      };
+    });
+  }
+
+  test('Wrong network on Deposit surfaces the switch-network prompt', async ({
     page,
     freighter,
     horizon,
@@ -167,31 +196,26 @@ test.describe('Vault failure matrix (issue #187)', () => {
       networkPassphrase: 'Public Global Stellar Network ; September 2015',
     });
     await horizon.mock({ accountExists: true, accountBalance: '1000' });
+    await injectVaultContract(page);
 
     await page.goto('/vault');
     await selectStellar(page);
     await connectFreighter(page);
 
-    // Switch to the Claim tab; the deposit rows come from a mock list so
-    // Claim is always reachable.
+    await fillDepositForm(page);
+    // Two "Create Deposit" nodes exist: the tab button and the submit
+    // button. Take the last, which is the submit.
     await page
-      .getByRole('button', { name: /^Claim$/i })
-      .first()
+      .getByRole('button', { name: /^Create Deposit$/i })
+      .last()
       .click();
 
-    // First claim button inside the deposit list. The button text is
-    // "Claim" per StellarVaultClaim; the tab switch button uses the same
-    // word, so we scope by role and take the last button rendered by the
-    // list rather than the tab.
-    const claimButtons = page.getByRole('button', { name: /^Claim$/i });
-    await claimButtons.last().click();
-
-    await expect(page.getByRole('heading', { name: 'Network Mismatch' })).toBeVisible({
-      timeout: 10_000,
-    });
+    await expect(
+      page.getByText(/Switch Freighter to Stellar Testnet before creating a deposit/),
+    ).toBeVisible({ timeout: 10_000 });
   });
 
-  test('Signature rejected on Claim surfaces a rejection message', async ({
+  test('Signature rejected on Deposit surfaces a rejection message', async ({
     page,
     freighter,
     horizon,
@@ -199,23 +223,27 @@ test.describe('Vault failure matrix (issue #187)', () => {
     await freighter.mock({
       isConnected: true,
       address: MOCK_ADDRESS,
-      shouldFailSignMessage: true,
+      shouldFailSignTx: true,
     });
     await horizon.mock({ accountExists: true, accountBalance: '1000' });
+    await injectVaultContract(page);
 
     await page.goto('/vault');
     await selectStellar(page);
     await connectFreighter(page);
 
+    await fillDepositForm(page);
+    // Two "Create Deposit" nodes exist: the tab button and the submit
+    // button. Take the last, which is the submit.
     await page
-      .getByRole('button', { name: /^Claim$/i })
-      .first()
+      .getByRole('button', { name: /^Create Deposit$/i })
+      .last()
       .click();
-    const claimButtons = page.getByRole('button', { name: /^Claim$/i });
-    await claimButtons.last().click();
 
-    await expect(page.getByText(/User rejected signature|Claim failed/i)).toBeVisible({
-      timeout: 10_000,
+    // Signing failures bubble up as the raw wallet message or as the
+    // generic "Deposit failed" fallback depending on which step throws.
+    await expect(page.getByText(/User rejected transaction signing|Deposit failed/i)).toBeVisible({
+      timeout: 15_000,
     });
   });
 
